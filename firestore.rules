@@ -1,0 +1,113 @@
+rules_version = '2';
+
+// 도산 아카데미 원우수첩 — Firestore 보안 규칙
+// 화면에서 버튼을 숨기는 것과 별개로, 모든 권한은 이 규칙이 서버에서 최종 판단합니다.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ───────── 공통 함수 ─────────
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email != null;
+    }
+
+    function myEmail() {
+      return request.auth.token.email.lower();
+    }
+
+    function allowedUserPath() {
+      return /databases/$(database)/documents/allowedUsers/$(myEmail());
+    }
+
+    function myRole() {
+      return get(allowedUserPath()).data.role;
+    }
+
+    // 허용 목록(allowedUsers)에 등록된 편집자 또는 관리자
+    function isAllowed() {
+      return isSignedIn()
+        && request.auth.token.email_verified == true
+        && exists(allowedUserPath())
+        && myRole() in ['editor', 'admin'];
+    }
+
+    function isAdmin() {
+      return isAllowed() && myRole() == 'admin';
+    }
+
+    // ★ 연락처(전화·이메일·메모) 열람 범위 — src/config/policy.ts 의 CONTACT_VISIBILITY 와 맞춰 주세요.
+    //   'signedIn' → isSignedIn()   /   'allowed' → isAllowed()
+    function canReadContact() {
+      return isSignedIn();
+    }
+
+    function isOptionalString(data, field, maxLen) {
+      return !(field in data) || (data[field] is string && data[field].size() <= maxLen);
+    }
+
+    function isValidMember(data) {
+      return data.keys().hasOnly([
+          'name', 'cohort', 'position', 'organization', 'photoUrl', 'searchKeywords',
+          'createdAt', 'createdBy', 'updatedAt', 'updatedBy'
+        ])
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 50
+        && data.cohort is int && data.cohort >= 1 && data.cohort <= 999
+        && isOptionalString(data, 'position', 100)
+        && isOptionalString(data, 'organization', 100)
+        && (!('photoUrl' in data) || data.photoUrl == null
+            || (data.photoUrl is string && data.photoUrl.size() <= 2000))
+        && (!('searchKeywords' in data) || (data.searchKeywords is list && data.searchKeywords.size() <= 30));
+    }
+
+    function isValidContact(data) {
+      return data.keys().hasOnly(['phone', 'email', 'memo'])
+        && isOptionalString(data, 'phone', 30)
+        && isOptionalString(data, 'email', 254)
+        && isOptionalString(data, 'memo', 2000);
+    }
+
+    // ───────── 원우 (공개 정보) ─────────
+    match /members/{memberId} {
+      allow read: if true;
+
+      // 생성: 작성자·시각은 본인 이메일과 서버 시각으로만 기록 가능
+      allow create: if isAllowed()
+        && isValidMember(request.resource.data)
+        && request.resource.data.createdBy == myEmail()
+        && request.resource.data.updatedBy == myEmail()
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time;
+
+      // 수정: 최초 작성 이력은 변경 불가, 수정자·시각은 본인/서버 시각
+      allow update: if isAllowed()
+        && isValidMember(request.resource.data)
+        && request.resource.data.get('createdBy', null) == resource.data.get('createdBy', null)
+        && request.resource.data.get('createdAt', null) == resource.data.get('createdAt', null)
+        && request.resource.data.updatedBy == myEmail()
+        && request.resource.data.updatedAt == request.time;
+
+      allow delete: if isAdmin();
+
+      // ───────── 원우 연락처 (비공개) ─────────
+      match /private/{docId} {
+        allow read: if docId == 'contact' && canReadContact();
+        allow create, update: if docId == 'contact' && isAllowed() && isValidContact(request.resource.data);
+        allow delete: if isAdmin();
+      }
+    }
+
+    // ───────── 허용 목록 ─────────
+    match /allowedUsers/{email} {
+      // 본인 문서는 본인이 읽을 수 있음 (로그인 시 권한 확인용). 전체 목록은 관리자만.
+      allow get: if isSignedIn() && email == myEmail();
+      allow read: if isAdmin();
+
+      allow create, update: if isAdmin()
+        && email == email.lower()
+        && request.resource.data.keys().hasOnly(['role', 'addedBy', 'addedAt'])
+        && request.resource.data.role in ['editor', 'admin'];
+
+      // 관리자가 실수로 자기 자신을 지우지 못하도록
+      allow delete: if isAdmin() && email != myEmail();
+    }
+  }
+}

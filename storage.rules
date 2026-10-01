@@ -1,0 +1,39 @@
+rules_version = '2';
+
+// 도산 아카데미 원우수첩 — Storage 보안 규칙
+// 원우 사진: members/{memberId}/{파일명}
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function allowedUserPath() {
+      return /databases/(default)/documents/allowedUsers/$(request.auth.token.email.lower());
+    }
+
+    // Firestore 허용 목록(allowedUsers)에 편집자/관리자로 등록된 사용자
+    function isAllowed() {
+      return request.auth != null
+        && request.auth.token.email != null
+        && request.auth.token.email_verified == true
+        && firestore.exists(allowedUserPath())
+        && firestore.get(allowedUserPath()).data.role in ['editor', 'admin'];
+    }
+
+    match /members/{memberId}/{fileName} {
+      // 사진은 공개 명단에 표시되므로 누구나 볼 수 있음
+      allow read: if true;
+
+      // 업로드: 허용 사용자 + jpg/png + 5MB 이하
+      allow create, update: if isAllowed()
+        && request.resource.size <= 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/(jpeg|png)');
+
+      // 사진 교체·원우 삭제 시 이전 파일 정리
+      allow delete: if isAllowed();
+    }
+
+    // 그 밖의 경로는 모두 차단
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
